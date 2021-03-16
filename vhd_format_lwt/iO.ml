@@ -160,6 +160,9 @@ module IO = struct
     with e -> fail e
 
   include Fd
+
+  type 'a async = 'a t
+  module Mutex = Lwt_mutex
 end
 
 include IO

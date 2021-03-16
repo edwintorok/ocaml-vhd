@@ -18,6 +18,20 @@
 let sector_size = 512
 let sector_shift = 9
 
+(* TODO: this doesn't actually increase qdepth,
+  just makes reads and writes run concurrently,
+  we'll only issue the next read once the previous completes,
+  but should still be better than what we have now.
+  Due to the lock in IO.ml.
+  This is because there is no Lwt_bytes.pread and the offet requires a lock.
+  There is Lwt_unix.pread, but that deals with Lwt_bytes, and not bigarrays.
+  Similarly there is Lwt_unix.readv, but that doens't have a preadv variant!
+  This should be fixed in Lwt, or adding a custom job.
+
+  Meanwhile set this to just 2 *)
+
+let read_qdepth = 2 (* TODO: make it configurable *)
+
 exception Cstruct_differ
 
 let cstruct_equal a b =
@@ -2022,6 +2036,31 @@ module From_file = functor(F: S.FILE) -> struct
   let twomib_bytes = 2 * 1024 * 1024
   let twomib_sectors = twomib_bytes / 512
 
+  module RingBuffer = struct
+    module Slot = struct
+      type t ={
+        lock: Mutex.t;
+        buffer: Cstruct.t
+      }
+
+      let create bytes = { lock = Mutex.create (); buffer = Memory.alloc bytes }
+    end
+
+    type t = {
+      slots: Slot.t array;
+      mutable next: int
+    }
+
+    let create n bytes = { slots = Array.init n (fun _ -> Slot.create bytes); next = 0 }
+
+    let get t =
+      let slot = t.slots.(t.next) in
+      t.next <- (t.next + 1) mod (Array.length t.slots);
+      Mutex.lock slot.lock >>= fun () ->
+      let free () = Mutex.unlock slot.lock in
+      return (slot.buffer, free)
+  end
+
   let rec expand_empty_elements twomib_empty s =
     let open Int64 in
     s >>= function
@@ -2055,19 +2094,24 @@ module From_file = functor(F: S.FILE) -> struct
     | Cons(`Copy(h, sector_start, sector_len), next) ->
         let rec copy sector_start sector_len =
           let this = to_int (min sector_len (of_int twomib_sectors)) in
-          let data = Cstruct.sub buffer 0 (this * 512) in
+          RingBuffer.get buffer >>= fun (buf, free_buf) ->
+          let data = Cstruct.sub buf 0 (this * 512) in
           really_read h (sector_start ** 512L) data >>= fun () ->
           let sector_start = sector_start ++ (of_int this) in
           let sector_len = sector_len -- (of_int this) in
-          let next () = if sector_len > 0L then copy sector_start sector_len else expand_copy_elements buffer (next ()) in
+          (* start readahead as soon as possible *)
+          let readahead = if sector_len > 0L then copy sector_start sector_len else expand_copy_elements buffer (next ()) in
+          let next () =
+            (* only unlock the buffer when done using it, this gets called after write completes *)
+            free_buf(); readahead in
           return (Cons(`Sectors data, next)) in
         copy sector_start sector_len
-    | Cons(x, next) -> return (Cons(x, fun () -> expand_copy_elements buffer (next ())))
+    | Cons(x, next) -> return (Cons(x, let next = expand_copy_elements buffer (next ()) in fun () -> next))
 
   let expand_copy s =
     let open Int64 in
     let size = { s.size with copy = 0L; metadata = s.size.metadata ++ s.size.copy } in
-    let buffer = Memory.alloc twomib_bytes in
+    let buffer = RingBuffer.create read_qdepth twomib_bytes in
     expand_copy_elements buffer (return s.elements) >>= fun elements ->
     return { elements; size }
 

@@ -18,6 +18,14 @@ module type ASYNC = sig
   val (>>=): 'a t -> ('a -> 'b t) -> 'b t
   val fail: exn -> 'a t
   val return: 'a -> 'a t
+
+  type 'a async = 'a t
+  module Mutex : sig
+    type t
+    val create: unit -> t
+    val lock: t -> unit async
+    val unlock: t -> unit
+  end
 end
 
 module type TIME = sig
